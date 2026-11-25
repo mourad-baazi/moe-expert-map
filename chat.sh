@@ -25,7 +25,7 @@ exec ./toolchain/llama-cuda/llama-server.exe \
   -m $MODEL \
   -ngl 99 \
   -ot "blk\.($LAYERS)\.ffn_.*_exps=CUDA0,exps=CPU" \
-  -t 6 \
+  -t 12 \
   -c $CTX \
   -np 1 \
   -ub 128 -b 128 \

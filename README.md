@@ -182,6 +182,20 @@ The 1–4% of routing weight that cold experts carry matters more than the numbe
 (per-expert placement inside llama.cpp, keeping every expert) is the right next step. `./chat.sh lite` runs the
 112-expert model for anyone who prefers speed.
 
+## Result 4: what limits speed now
+
+- **More CPU threads help:** 6 → 18.5, 8 → 20.3, 12 → 21.0 tokens/s (`chat.sh` now uses 12). If RAM speed were the
+  limit, extra threads would not help.
+- **RAM is mostly idle:** at ~19 tokens/s the CPU-side experts need only ~4 GB/s of the ~45 GB/s available.
+- **Cost per CPU expert pass:** all experts on CPU (48 passes) takes 106 ms per token, loop-aware placement
+  (18 passes) 54 ms, so each CPU pass costs about **1.7 ms**, of which reading its 8 experts from RAM is only ~0.4 ms.
+  The rest is the CPU decoding the very small formats this file uses (IQ1_S at 1.6 bits for layers 0–4 and 6,
+  IQ2_* for the others, Q2_0 / NVFP4 / MXFP4 for the down projections).
+- **Repacking CPU experts to a simpler format does not help yet:** Q8_0 keeps them almost exact (0.2–0.5% error) but is
+  5× more data and made generation slower (16.4 vs 20.7 tokens/s for layers 0–4). Q4_0/Q5_0 written by gguf-py's
+  simple quantizer add 3–11% error. A proper requantization would need the original 16-bit weights and llama.cpp's
+  own quantizer (`scripts/repack_cpu_experts.py` is kept for experiments).
+
 ## Chat with it
 
 `./chat.sh` (Git Bash) starts `llama-server` with loop-aware placement and opens a chat page at http://localhost:8080.
