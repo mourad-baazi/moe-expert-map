@@ -1,0 +1,1271 @@
+# Source: llama.cpp gguf-py (MIT License, https://github.com/ggml-org/llama.cpp/tree/master/gguf-py)
+
+# ---- file: gguf/gguf_reader.py
+#
+# GGUF file reading/modification support. For API usage information,
+# please see the files scripts/ for some fairly simple examples.
+#
+from __future__ import annotations
+
+import logging
+import os
+import sys
+from collections import OrderedDict
+from typing import Any, Literal, NamedTuple, TypeVar, Union
+
+import numpy as np
+import numpy.typing as npt
+
+from .quants import quant_shape_to_byte_shape
+
+if __name__ == "__main__":
+    from pathlib import Path
+
+    # Allow running file in package as a script.
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from gguf.constants import (
+    GGML_MAX_DIMS,
+    GGML_QUANT_SIZES,
+    GGUF_DEFAULT_ALIGNMENT,
+    GGUF_MAGIC,
+    GGUF_VERSION,
+    GGMLQuantizationType,
+    GGUFValueType,
+    GGUFEndian,
+)
+
+# limits mirroring ggml/src/gguf.cpp (not part of gguf.h)
+GGUF_MAX_STRING_LENGTH  = 1024 * 1024 * 1024
+GGUF_MAX_ARRAY_ELEMENTS = 1024 * 1024 * 1024
+
+logger = logging.getLogger(__name__)
+
+READER_SUPPORTED_VERSIONS = [2, GGUF_VERSION]
+
+
+class ReaderField(NamedTuple):
+    # Offset to start of this field.
+    offset: int
+
+    # Name of the field (not necessarily from file data).
+    name: str
+
+    # Data parts. Some types have multiple components, such as strings
+    # that consist of a length followed by the string data.
+    parts: list[npt.NDArray[Any]] = []
+
+    # Indexes into parts that we can call the actual data. For example
+    # an array of strings will be populated with indexes to the actual
+    # string data.
+    data: list[int] = [-1]
+
+    types: list[GGUFValueType] = []
+
+    def contents(self, index_or_slice: int | slice = slice(None)) -> Any:
+        if self.types:
+            to_string = lambda x: str(x.tobytes(), encoding='utf-8') # noqa: E731
+            main_type = self.types[0]
+
+            if main_type == GGUFValueType.ARRAY:
+                sub_type = self.types[-1]
+
+                if sub_type == GGUFValueType.STRING:
+                    indices = self.data[index_or_slice]
+
+                    if isinstance(index_or_slice, int):
+                        return to_string(self.parts[indices]) # type: ignore
+                    else:
+                        return [to_string(self.parts[idx]) for idx in indices] # type: ignore
+                else:
+                    # FIXME: When/if _get_field_parts() support multi-dimensional arrays, this must do so too
+
+                    # Check if it's unsafe to perform slice optimization on data
+                    # if any(True for idx in self.data if len(self.parts[idx]) != 1):
+                    #     optim_slice = slice(None)
+                    # else:
+                    #     optim_slice = index_or_slice
+                    #     index_or_slice = slice(None)
+
+                    # if isinstance(optim_slice, int):
+                    #     return self.parts[self.data[optim_slice]].tolist()[0]
+                    # else:
+                    #     return [pv for idx in self.data[optim_slice] for pv in self.parts[idx].tolist()][index_or_slice]
+
+                    if isinstance(index_or_slice, int):
+                        return self.parts[self.data[index_or_slice]].tolist()[0]
+                    else:
+                        return [pv for idx in self.data[index_or_slice] for pv in self.parts[idx].tolist()]
+
+            if main_type == GGUFValueType.STRING:
+                return to_string(self.parts[-1])
+            else:
+                return self.parts[-1].tolist()[0]
+
+        return None
+
+
+class ReaderTensor(NamedTuple):
+    name: str
+    tensor_type: GGMLQuantizationType
+    shape: npt.NDArray[np.uint32]
+    n_elements: int
+    n_bytes: int
+    data_offset: int
+    data: npt.NDArray[Any]
+    field: ReaderField
+
+
+class GGUFReader:
+    # I - same as host, S - swapped
+    byte_order: Literal['I', 'S'] = 'I'
+    alignment: int = GGUF_DEFAULT_ALIGNMENT
+    data_offset: int
+
+    # Note: Internal helper, API may change.
+    gguf_scalar_to_np: dict[GGUFValueType, type[np.generic]] = {
+        GGUFValueType.UINT8:   np.uint8,
+        GGUFValueType.INT8:    np.int8,
+        GGUFValueType.UINT16:  np.uint16,
+        GGUFValueType.INT16:   np.int16,
+        GGUFValueType.UINT32:  np.uint32,
+        GGUFValueType.INT32:   np.int32,
+        GGUFValueType.FLOAT32: np.float32,
+        GGUFValueType.UINT64:  np.uint64,
+        GGUFValueType.INT64:   np.int64,
+        GGUFValueType.FLOAT64: np.float64,
+        GGUFValueType.BOOL:    np.bool_,
+    }
+
+    def __init__(self, path: os.PathLike[str] | str, mode: Literal['r', 'r+', 'c'] = 'r'):
+        self.data = np.memmap(path, mode = mode)
+        offs = 0
+
+        # Check for GGUF magic
+        if self._get(offs, np.uint32, override_order = '<')[0] != GGUF_MAGIC:
+            raise ValueError('GGUF magic invalid')
+        offs += 4
+
+        # Check GGUF version
+        temp_version = self._get(offs, np.uint32)
+        if temp_version[0] & 65535 == 0:
+            # If we get 0 here that means it's (probably) a GGUF file created for
+            # the opposite byte order of the machine this script is running on.
+            self.byte_order = 'S'
+            temp_version = temp_version.view(temp_version.dtype.newbyteorder(self.byte_order))
+        version = temp_version[0]
+        if version not in READER_SUPPORTED_VERSIONS:
+            raise ValueError(f'Sorry, file appears to be version {version} which we cannot handle')
+        if sys.byteorder == "little":
+            # Host is little endian
+            host_endian = GGUFEndian.LITTLE
+            swapped_endian = GGUFEndian.BIG
+        else:
+            # Sorry PDP or other weird systems that don't use BE or LE.
+            host_endian = GGUFEndian.BIG
+            swapped_endian = GGUFEndian.LITTLE
+        self.endianess = swapped_endian if self.byte_order == "S" else host_endian
+        self.fields: OrderedDict[str, ReaderField] = OrderedDict()
+        self.tensors: list[ReaderTensor] = []
+        offs += self._push_field(ReaderField(offs, 'GGUF.version', [temp_version], [0], [GGUFValueType.UINT32]))
+
+        # Check tensor count and kv count
+        temp_counts = self._get(offs, np.uint64, 2)
+        offs += self._push_field(ReaderField(offs, 'GGUF.tensor_count', [temp_counts[:1]], [0], [GGUFValueType.UINT64]))
+        offs += self._push_field(ReaderField(offs, 'GGUF.kv_count', [temp_counts[1:]], [0], [GGUFValueType.UINT64]))
+        tensor_count, kv_count = temp_counts
+        if tensor_count > GGUF_MAX_ARRAY_ELEMENTS:
+            raise ValueError(f'Tensor count {tensor_count} exceeds maximum {GGUF_MAX_ARRAY_ELEMENTS}')
+        if kv_count > GGUF_MAX_ARRAY_ELEMENTS:
+            raise ValueError(f'KV count {kv_count} exceeds maximum {GGUF_MAX_ARRAY_ELEMENTS}')
+        offs = self._build_fields(offs, kv_count)
+
+        # Build Tensor Info Fields
+        offs, tensors_fields = self._build_tensor_info(offs, tensor_count)
+        new_align = self.fields.get('general.alignment')
+        if new_align is not None:
+            if new_align.types != [GGUFValueType.UINT32]:
+                raise ValueError('Bad type for general.alignment field')
+            self.alignment = new_align.parts[-1][0]
+            # Ensure alignment is a non-zero power of two
+            if self.alignment == 0 or (self.alignment & (self.alignment - 1)) != 0:
+                raise ValueError('Invalid alignment: must be a non-zero power of two')
+        padding = offs % self.alignment
+        if padding != 0:
+            offs += int(self.alignment - padding)
+        self.data_offset = offs
+        self._build_tensors(offs, tensors_fields)
+
+    _DT = TypeVar('_DT', bound = npt.DTypeLike)
+
+    # Fetch a key/value metadata field by key.
+    def get_field(self, key: str) -> Union[ReaderField, None]:
+        return self.fields.get(key, None)
+
+    # Fetch a tensor from the list by index.
+    def get_tensor(self, idx: int) -> ReaderTensor:
+        return self.tensors[idx]
+
+    def _get(
+        self, offset: int, dtype: npt.DTypeLike, count: int = 1, override_order: None | Literal['I', 'S', '<'] = None,
+    ) -> npt.NDArray[Any]:
+        count = int(count)
+        itemsize = int(np.empty([], dtype = dtype).itemsize)
+        end_offs = offset + itemsize * count
+        arr = self.data[offset:end_offs].view(dtype=dtype)[:count]
+        return arr.view(arr.dtype.newbyteorder(self.byte_order if override_order is None else override_order))
+
+    def _push_field(self, field: ReaderField, skip_sum: bool = False) -> int:
+        if field.name in self.fields:
+            # TODO: add option to make this a warning and accept duplicate keys like below
+            raise KeyError(f'Duplicate {field.name} already in list at offset {field.offset}')
+
+            # logger.warning(f'Duplicate key {field.name} at offset {field.offset}')
+            # self.fields[field.name + '_{}'.format(field.offset)] = field
+        else:
+            self.fields[field.name] = field
+        return 0 if skip_sum else sum(int(part.nbytes) for part in field.parts)
+
+    def _get_str(self, offset: int) -> tuple[npt.NDArray[np.uint64], npt.NDArray[np.uint8]]:
+        slen = self._get(offset, np.uint64)
+        if int(slen[0]) > GGUF_MAX_STRING_LENGTH:
+            raise ValueError(f'String length {int(slen[0])} exceeds maximum {GGUF_MAX_STRING_LENGTH}')
+        if offset + 8 + int(slen[0]) > self.data.nbytes:
+            raise ValueError(f'String length {int(slen[0])} exceeds remaining file size {self.data.nbytes - offset - 8}')
+        return slen, self._get(offset + 8, np.uint8, slen[0])
+
+    def _get_field_parts(
+        self, orig_offs: int, raw_type: int,
+    ) -> tuple[int, list[npt.NDArray[Any]], list[int], list[GGUFValueType]]:
+        offs = orig_offs
+        types: list[GGUFValueType] = []
+        gtype = GGUFValueType(raw_type)
+        types.append(gtype)
+        # Handle strings.
+        if gtype == GGUFValueType.STRING:
+            sparts: list[npt.NDArray[Any]] = list(self._get_str(offs))
+            size = sum(int(part.nbytes) for part in sparts)
+            return size, sparts, [1], types
+        # Check if it's a simple scalar type.
+        nptype = self.gguf_scalar_to_np.get(gtype)
+        if nptype is not None:
+            val = self._get(offs, nptype)
+            return int(val.nbytes), [val], [0], types
+        # Handle arrays.
+        if gtype == GGUFValueType.ARRAY:
+            raw_itype = self._get(offs, np.uint32)
+            offs += int(raw_itype.nbytes)
+            alen = self._get(offs, np.uint64)
+            if int(alen[0]) > GGUF_MAX_ARRAY_ELEMENTS:
+                raise ValueError(f'Array length {int(alen[0])} exceeds maximum {GGUF_MAX_ARRAY_ELEMENTS}')
+            offs += int(alen.nbytes)
+            aparts: list[npt.NDArray[Any]] = [raw_itype, alen]
+            data_idxs: list[int] = []
+            # FIXME: Handle multi-dimensional arrays properly instead of flattening
+            for idx in range(alen[0]):
+                curr_size, curr_parts, curr_idxs, curr_types = self._get_field_parts(offs, raw_itype[0])
+                if idx == 0:
+                    types += curr_types
+                idxs_offs = len(aparts)
+                aparts += curr_parts
+                data_idxs += (idx + idxs_offs for idx in curr_idxs)
+                offs += curr_size
+            return offs - orig_offs, aparts, data_idxs, types
+        # We can't deal with this one.
+        raise ValueError(f'Unknown/unhandled field type {gtype}')
+
+    def _get_tensor_info_field(self, orig_offs: int) -> ReaderField:
+        offs = orig_offs
+
+        # Get Tensor Name
+        name_len, name_data = self._get_str(offs)
+        offs += int(name_len.nbytes + name_data.nbytes)
+
+        # Get Tensor Dimensions Count
+        n_dims = self._get(offs, np.uint32)
+        offs += int(n_dims.nbytes)
+        if n_dims[0] > GGML_MAX_DIMS:
+            raise ValueError(f'Tensor dimensions count {n_dims[0]} exceeds GGML_MAX_DIMS ({GGML_MAX_DIMS})')
+
+        # Get Tensor Dimension Array
+        dims = self._get(offs, np.uint64, n_dims[0])
+        offs += int(dims.nbytes)
+
+        # Get Tensor Encoding Scheme Type
+        raw_dtype = self._get(offs, np.uint32)
+        offs += int(raw_dtype.nbytes)
+
+        # Get Tensor Offset
+        offset_tensor = self._get(offs, np.uint64)
+        offs += int(offset_tensor.nbytes)
+
+        return ReaderField(
+            orig_offs,
+            str(bytes(name_data), encoding = 'utf-8'),
+            [name_len, name_data, n_dims, dims, raw_dtype, offset_tensor],
+            [1, 3, 4, 5],
+        )
+
+    def _build_fields(self, offs: int, count: int) -> int:
+        for _ in range(count):
+            orig_offs = offs
+            kv_klen, kv_kdata = self._get_str(offs)
+            offs += int(kv_klen.nbytes + kv_kdata.nbytes)
+            raw_kv_type = self._get(offs, np.uint32)
+            offs += int(raw_kv_type.nbytes)
+            parts: list[npt.NDArray[Any]] = [kv_klen, kv_kdata, raw_kv_type]
+            idxs_offs = len(parts)
+            field_size, field_parts, field_idxs, field_types = self._get_field_parts(offs, raw_kv_type[0])
+            parts += field_parts
+            self._push_field(ReaderField(
+                orig_offs,
+                str(bytes(kv_kdata), encoding = 'utf-8'),
+                parts,
+                [idx + idxs_offs for idx in field_idxs],
+                field_types,
+            ), skip_sum = True)
+            offs += field_size
+        return offs
+
+    def _build_tensor_info(self, offs: int, count: int) -> tuple[int, list[ReaderField]]:
+        tensor_fields = []
+        for _ in range(count):
+            field = self._get_tensor_info_field(offs)
+            offs += sum(int(part.nbytes) for part in field.parts)
+            tensor_fields.append(field)
+        return offs, tensor_fields
+
+    def _build_tensors(self, start_offs: int, fields: list[ReaderField]) -> None:
+        tensors = []
+        tensor_names = set() # keep track of name to prevent duplicated tensors
+        for field in fields:
+            _name_len, name_data, _n_dims, dims, raw_dtype, offset_tensor = field.parts
+            # check if there's any tensor having same name already in the list
+            tensor_name = str(bytes(name_data), encoding = 'utf-8')
+            if tensor_name in tensor_names:
+                raise ValueError(f'Found duplicated tensor with name {tensor_name}')
+            tensor_names.add(tensor_name)
+            ggml_type = GGMLQuantizationType(raw_dtype[0])
+            # use Python ints: np.prod on uint64 wraps silently on overflow
+            n_elems = 1
+            for dim in dims.tolist():
+                n_elems *= int(dim)
+            np_dims = tuple(reversed(dims.tolist()))
+            block_size, type_size = GGML_QUANT_SIZES[ggml_type]
+            n_bytes = n_elems * type_size // block_size
+            data_offs = start_offs + int(offset_tensor[0])
+            if data_offs + n_bytes > self.data.nbytes:
+                raise ValueError(f'Tensor {tensor_name} data exceeds file size {self.data.nbytes}')
+            item_type: npt.DTypeLike
+            if ggml_type == GGMLQuantizationType.F16:
+                item_count = n_elems
+                item_type = np.float16
+            elif ggml_type == GGMLQuantizationType.F32:
+                item_count = n_elems
+                item_type = np.float32
+            elif ggml_type == GGMLQuantizationType.F64:
+                item_count = n_elems
+                item_type = np.float64
+            elif ggml_type == GGMLQuantizationType.I8:
+                item_count = n_elems
+                item_type = np.int8
+            elif ggml_type == GGMLQuantizationType.I16:
+                item_count = n_elems
+                item_type = np.int16
+            elif ggml_type == GGMLQuantizationType.I32:
+                item_count = n_elems
+                item_type = np.int32
+            elif ggml_type == GGMLQuantizationType.I64:
+                item_count = n_elems
+                item_type = np.int64
+            else:
+                item_count = n_bytes
+                item_type = np.uint8
+                np_dims = quant_shape_to_byte_shape(np_dims, ggml_type)
+            tensors.append(ReaderTensor(
+                name = tensor_name,
+                tensor_type = ggml_type,
+                shape = dims,
+                n_elements = n_elems,
+                n_bytes = n_bytes,
+                data_offset = data_offs,
+                data = self._get(data_offs, item_type, item_count).reshape(np_dims),
+                field = field,
+            ))
+        self.tensors = tensors
+
+# ---- file: gguf/lazy.py
+from __future__ import annotations
+from abc import ABC, ABCMeta, abstractmethod
+
+import logging
+from typing import Any, Callable
+
+import numpy as np
+from numpy.typing import DTypeLike
+
+
+logger = logging.getLogger(__name__)
+
+
+class LazyMeta(ABCMeta):
+
+    def __new__(cls, name: str, bases: tuple[type, ...], namespace: dict[str, Any], **kwargs):
+        def __getattr__(self, name: str) -> Any:
+            meta_attr = getattr(self._meta, name)
+            if callable(meta_attr):
+                return type(self)._wrap_fn(
+                    (lambda s, *args, **kwargs: getattr(s, name)(*args, **kwargs)),
+                    use_self=self,
+                )
+            elif isinstance(meta_attr, self._tensor_type):
+                # e.g. self.T with torch.Tensor should still be wrapped
+                return type(self)._wrap_fn(lambda s: getattr(s, name))(self)
+            else:
+                # no need to wrap non-tensor properties,
+                # and they likely don't depend on the actual contents of the tensor
+                return meta_attr
+
+        namespace["__getattr__"] = __getattr__
+
+        # need to make a builder for the wrapped wrapper to copy the name,
+        # or else it fails with very cryptic error messages,
+        # because somehow the same string would end up in every closures
+        def mk_wrap(op_name: str, *, meta_noop: bool = False):
+            # need to wrap the wrapper to get self
+            def wrapped_special_op(self, *args, **kwargs):
+                return type(self)._wrap_fn(
+                    getattr(type(self)._tensor_type, op_name),
+                    meta_noop=meta_noop,
+                )(self, *args, **kwargs)
+            return wrapped_special_op
+
+        # special methods bypass __getattr__, so they need to be added manually
+        # ref: https://docs.python.org/3/reference/datamodel.html#special-lookup
+        # NOTE: doing this from a metaclass is very convenient
+        # TODO: make this even more comprehensive
+        for binary_op in (
+            "lt", "le", "eq", "ne", "ge", "gt",
+            "add", "and", "floordiv", "lshift", "mod", "mul", "matmul",
+            "or", "pow", "rshift", "sub", "truediv", "xor",
+            "iadd", "iand", "ifloordiv", "ilshift", "imod", "imul", "ior", "irshift", "isub", "ixor",
+            "radd", "rand", "rfloordiv", "rmul", "ror", "rpow", "rsub", "rtruediv", "rxor",
+        ):
+            attr_name = f"__{binary_op}__"
+            # evaluation on the meta tensor is needed in case there's broadcasting
+            namespace[attr_name] = mk_wrap(attr_name, meta_noop=False)
+
+        for unary_op in ("not", "abs", "invert", "neg", "pos"):
+            attr_name = f"__{unary_op}__"
+            # the result of these operators usually has the same shape and dtype as the input,
+            # so evaluation on the meta tensor can be skipped.
+            namespace[attr_name] = mk_wrap(attr_name, meta_noop=True)
+
+        for special_op in (
+            "getitem", "setitem", "len",
+        ):
+            attr_name = f"__{special_op}__"
+            namespace[attr_name] = mk_wrap(attr_name, meta_noop=False)
+
+        return super().__new__(cls, name, bases, namespace, **kwargs)
+
+
+# Tree of lazy tensors
+class LazyBase(ABC, metaclass=LazyMeta):
+    _tensor_type: type
+    _meta: Any
+    _data: Any | None
+    _args: tuple
+    _kwargs: dict[str, Any]
+    _func: Callable[[Any], Any] | None
+
+    def __init__(self, *, meta: Any, data: Any | None = None, args: tuple = (), kwargs: dict[str, Any] | None = None, func: Callable[[Any], Any] | None = None):
+        super().__init__()
+        self._meta = meta
+        self._data = data
+        self._args = args
+        self._kwargs = kwargs if kwargs is not None else {}
+        self._func = func
+        assert self._func is not None or self._data is not None
+
+    def __init_subclass__(cls) -> None:
+        if "_tensor_type" not in cls.__dict__:
+            raise TypeError(f"property '_tensor_type' must be defined for {cls!r}")
+        return super().__init_subclass__()
+
+    @staticmethod
+    def _recurse_apply(o: Any, fn: Callable[[Any], Any]) -> Any:
+        # TODO: dict and set
+        if isinstance(o, (list, tuple)):
+            L = []
+            for item in o:
+                L.append(LazyBase._recurse_apply(item, fn))
+            if isinstance(o, tuple):
+                L = tuple(L)
+            return L
+        elif isinstance(o, LazyBase):
+            return fn(o)
+        else:
+            return o
+
+    @classmethod
+    def _wrap_fn(cls, fn: Callable, *, use_self: LazyBase | None = None, meta_noop: bool | DTypeLike | tuple[DTypeLike, Callable[[tuple[int, ...]], tuple[int, ...]]] = False) -> Callable[[Any], Any]:
+        def wrapped_fn(*args, **kwargs):
+            if kwargs is None:
+                kwargs = {}
+            args = ((use_self,) if use_self is not None else ()) + args
+
+            meta_args = LazyBase._recurse_apply(args, lambda t: t._meta)
+            # TODO: maybe handle tensors in kwargs too
+
+            if isinstance(meta_noop, bool) and not meta_noop:
+                try:
+                    res = fn(*meta_args, **kwargs)
+                except NotImplementedError:
+                    # running some operations on PyTorch's Meta tensors can cause this exception
+                    res = None
+            else:
+                # some operators don't need to actually run on the meta tensors
+                assert len(args) > 0
+                res = args[0]
+                assert isinstance(res, cls)
+                res = res._meta
+                # allow operations to override the dtype and shape
+                if meta_noop is not True:
+                    if isinstance(meta_noop, tuple):
+                        dtype, shape = meta_noop
+                        assert callable(shape)
+                        res = cls.meta_with_dtype_and_shape(dtype, shape(res.shape))
+                    else:
+                        res = cls.meta_with_dtype_and_shape(meta_noop, res.shape)
+
+            if isinstance(res, cls._tensor_type):
+                return cls(meta=cls.eager_to_meta(res), args=args, kwargs=kwargs, func=fn)
+            elif isinstance(res, tuple) and all(isinstance(t, cls._tensor_type) for t in res):
+                # share the evaluation between lazy tuple elements
+                shared_args: list = [args, None]
+
+                def eager_tuple_element(a: list[Any], i: int = 0, /, **kw) -> LazyBase:
+                    assert len(a) == 2
+                    if a[1] is None:
+                        a[1] = fn(*a[0], **kw)
+                    return a[1][i]
+                return tuple(cls(meta=cls.eager_to_meta(res[i]), args=(shared_args, i), kwargs=kwargs, func=eager_tuple_element) for i in range(len(res)))
+            else:
+                del res  # not needed
+                # non-tensor return likely relies on the contents of the args
+                # (e.g. the result of torch.equal)
+                eager_args = cls.to_eager(args)
+                return fn(*eager_args, **kwargs)
+        return wrapped_fn
+
+    @classmethod
+    def to_eager(cls, t: Any) -> Any:
+        def simple_to_eager(_t: LazyBase) -> Any:
+            if _t._data is not None:
+                return _t._data
+
+            # NOTE: there's a recursion limit in Python (usually 1000)
+
+            assert _t._func is not None
+            _t._args = cls._recurse_apply(_t._args, simple_to_eager)
+            _t._data = _t._func(*_t._args, **_t._kwargs)
+            # sanity check
+            assert _t._data is not None
+            assert _t._data.dtype == _t._meta.dtype
+            assert _t._data.shape == _t._meta.shape
+
+            return _t._data
+
+        # recurse into lists and/or tuples, keeping their structure
+        return cls._recurse_apply(t, simple_to_eager)
+
+    @classmethod
+    def eager_to_meta(cls, t: Any) -> Any:
+        return cls.meta_with_dtype_and_shape(t.dtype, t.shape)
+
+    # must be overridden, meta tensor init is backend-specific
+    @classmethod
+    @abstractmethod
+    def meta_with_dtype_and_shape(cls, dtype: Any, shape: Any) -> Any: pass
+
+    @classmethod
+    def from_eager(cls, t: Any) -> Any:
+        if type(t) is cls:
+            # already lazy
+            return t
+        elif isinstance(t, cls._tensor_type):
+            return cls(meta=cls.eager_to_meta(t), data=t)
+        else:
+            return TypeError(f"{type(t)!r} is not compatible with {cls._tensor_type!r}")
+
+
+class LazyNumpyTensor(LazyBase):
+    _tensor_type = np.ndarray
+
+    shape: tuple[int, ...]  # Makes the type checker happy in quants.py
+
+    @classmethod
+    def meta_with_dtype_and_shape(cls, dtype: DTypeLike, shape: tuple[int, ...]) -> np.ndarray[Any, Any]:
+        # The initial idea was to use np.nan as the fill value,
+        # but non-float types like np.int16 can't use that.
+        # So zero it is.
+        cheat = np.zeros(1, dtype)
+        return np.lib.stride_tricks.as_strided(cheat, shape, (0 for _ in shape))
+
+    def astype(self, dtype, *args, **kwargs):
+        meta = type(self).meta_with_dtype_and_shape(dtype, self._meta.shape)
+        full_args = (self, dtype,) + args
+        return type(self)(meta=meta, args=full_args, kwargs=kwargs, func=(lambda a, *args, **kwargs: a.astype(*args, **kwargs)))
+
+    def tofile(self, *args, **kwargs):
+        eager = LazyNumpyTensor.to_eager(self)
+        return eager.tofile(*args, **kwargs)
+
+    # TODO: __array_function__
+
+
+# Tensor written to file one row-chunk at a time
+class LazyChunkedTensor:
+
+    def __init__(
+        self, chunks: list[Callable[[], np.ndarray]], shape: tuple[int, ...], dtype: DTypeLike,
+        qtype: Any = None, byteswap: bool = False,
+    ):
+        self._chunks = chunks
+        self._qtype = qtype
+        self._byteswap = byteswap
+        self.shape = tuple(shape)
+        self.dtype = np.dtype(dtype)
+
+    @property
+    def nbytes(self) -> int:
+        n = self.dtype.itemsize
+        for d in self.shape:
+            n *= d
+        return n
+
+    def numpy(self) -> LazyChunkedTensor:
+        return self
+
+    def __array__(self, *args, **kwargs):
+        # numpy would otherwise make a 1-element object array of self, and write 8 bytes
+        raise TypeError("LazyChunkedTensor cannot become an ndarray, it is written in chunks")
+
+    def quantize(self, qtype: Any) -> LazyChunkedTensor:
+        from .constants import GGMLQuantizationType
+        from .quants import QuantError, quant_shape_to_byte_shape
+
+        if qtype == GGMLQuantizationType.F32:
+            shape, dtype = self.shape, np.dtype(np.float32)
+        elif qtype == GGMLQuantizationType.F16:
+            shape, dtype = self.shape, np.dtype(np.float16)
+        else:
+            try:
+                shape, dtype = quant_shape_to_byte_shape(self.shape, qtype), np.dtype(np.uint8)
+            except ValueError as e:
+                # raised here and not per chunk, so callers can still fall back to F16
+                raise QuantError(str(e)) from e
+        return LazyChunkedTensor(self._chunks, shape, dtype, qtype, self._byteswap)
+
+    def byteswap(self, inplace: bool = False) -> LazyChunkedTensor:
+        if inplace:
+            raise NotImplementedError("a chunked tensor cannot be byteswapped in place")
+        return LazyChunkedTensor(self._chunks, self.shape, self.dtype, self._qtype, not self._byteswap)
+
+    def tofile(self, *args, **kwargs) -> None:
+        from .quants import quantize
+
+        written = 0
+        for load_chunk in self._chunks:
+            chunk = load_chunk()
+            if self._qtype is not None:
+                # exact only because chunks split on rows, and blocks never cross one
+                chunk = quantize(chunk, self._qtype)
+            if self._byteswap:
+                chunk = chunk.byteswap(inplace=False)
+            chunk.tofile(*args, **kwargs)
+            written += chunk.nbytes
+            del chunk
+        assert written == self.nbytes, f"chunked tensor wrote {written} bytes, expected {self.nbytes}"
+
+# ---- file: gguf/quants.py
+from __future__ import annotations
+from abc import ABC, abstractmethod
+from typing import Any, Callable, Sequence
+from math import log2, ceil
+
+from numpy.typing import DTypeLike
+
+from .constants import GGML_QUANT_SIZES, GGMLQuantizationType, QK_K
+from .lazy import LazyNumpyTensor
+
+import numpy as np
+
+
+def quant_shape_to_byte_shape(shape: Sequence[int], quant_type: GGMLQuantizationType) -> tuple[int, ...]:
+    block_size, type_size = GGML_QUANT_SIZES[quant_type]
+    if shape[-1] % block_size != 0:
+        raise ValueError(f"Quantized tensor row size ({shape[-1]}) is not a multiple of {quant_type.name} block size ({block_size})")
+    return (*shape[:-1], shape[-1] // block_size * type_size)
+
+
+def quant_shape_from_byte_shape(shape: Sequence[int], quant_type: GGMLQuantizationType) -> tuple[int, ...]:
+    block_size, type_size = GGML_QUANT_SIZES[quant_type]
+    if shape[-1] % type_size != 0:
+        raise ValueError(f"Quantized tensor bytes per row ({shape[-1]}) is not a multiple of {quant_type.name} type size ({type_size})")
+    return (*shape[:-1], shape[-1] // type_size * block_size)
+
+
+# This is faster than np.vectorize and np.apply_along_axis because it works on more than one row at a time
+def _apply_over_grouped_rows(func: Callable[[np.ndarray], np.ndarray], arr: np.ndarray, otype: DTypeLike, oshape: tuple[int, ...]) -> np.ndarray:
+    rows = arr.reshape((-1, arr.shape[-1]))
+    assert len(rows.shape)
+    osize = 1
+    for dim in oshape:
+        osize *= dim
+    out = np.empty(shape=osize, dtype=otype)
+    # compute over groups of 16 rows (arbitrary, but seems good for performance)
+    n_groups = (rows.shape[0] // 16) or 1
+    np.concatenate([func(group).ravel() for group in np.array_split(rows, n_groups)], axis=0, out=out)
+    return out.reshape(oshape)
+
+
+# round away from zero
+# ref: https://stackoverflow.com/a/59143326/22827863
+def np_roundf(n: np.ndarray) -> np.ndarray:
+    # np.abs, not abs(): numpy < 2.3 on Python 3.14 can write abs() in place into n when the caller passes a temporary (numpy/numpy#28681), dropping the sign
+    a = np.abs(n)
+    floored = np.floor(a)
+    b = floored + np.floor(2 * (a - floored))
+    return np.sign(n) * b
+
+
+class QuantError(Exception): ...
+
+
+_type_traits: dict[GGMLQuantizationType, type[__Quant]] = {}
+
+
+def quantize(data: np.ndarray, qtype: GGMLQuantizationType) -> np.ndarray:
+    if qtype == GGMLQuantizationType.F32:
+        return data.astype(np.float32, copy=False)
+    elif qtype == GGMLQuantizationType.F16:
+        return data.astype(np.float16, copy=False)
+    elif (q := _type_traits.get(qtype)) is not None:
+        return q.quantize(data)
+    else:
+        raise NotImplementedError(f"Quantization for {qtype.name} is not yet implemented")
+
+
+def dequantize(data: np.ndarray, qtype: GGMLQuantizationType) -> np.ndarray:
+    if qtype == GGMLQuantizationType.F32:
+        return data.view(np.float32)
+    elif qtype == GGMLQuantizationType.F16:
+        return data.view(np.float16).astype(np.float32)
+    elif (q := _type_traits.get(qtype)) is not None:
+        return q.dequantize(data)
+    else:
+        raise NotImplementedError(f"Dequantization for {qtype.name} is not yet implemented")
+
+
+class __Quant(ABC):
+    qtype: GGMLQuantizationType
+    block_size: int
+    type_size: int
+
+    grid: np.ndarray[Any, np.dtype[np.float32]] | None = None
+    grid_shape: tuple[int, int] = (0, 0)
+    grid_map: tuple[int | float, ...] = ()
+    grid_hex: bytes | None = None
+
+    def __init__(self):
+        return TypeError("Quant conversion classes can't have instances")
+
+    def __init_subclass__(cls, qtype: GGMLQuantizationType) -> None:
+        cls.qtype = qtype
+        cls.block_size, cls.type_size = GGML_QUANT_SIZES[qtype]
+        cls.__quantize_lazy: Any = LazyNumpyTensor._wrap_fn(
+            cls.__quantize_array,
+            meta_noop=(np.uint8, cls.__shape_to_bytes)
+        )
+        cls.__dequantize_lazy: Any = LazyNumpyTensor._wrap_fn(
+            cls.__dequantize_array,
+            meta_noop=(np.float32, cls.__shape_from_bytes)
+        )
+        assert qtype not in _type_traits
+        _type_traits[qtype] = cls
+
+    @classmethod
+    def init_grid(cls):
+        if cls.grid is not None or cls.grid_hex is None:
+            return
+
+        bits_per_elem = ceil(log2(len(cls.grid_map)))
+        assert bits_per_elem != 0, cls.qtype.name
+        elems_per_byte = 8 // bits_per_elem
+
+        grid = np.frombuffer(cls.grid_hex, dtype=np.uint8)
+        # decode hexadecimal chars from grid
+        grid = grid.reshape((-1, 2))
+        grid = (np.where(grid > 0x40, grid + 9, grid) & 0x0F) << np.array([4, 0], dtype=np.uint8).reshape((1, 2))
+        grid = grid[..., 0] | grid[..., 1]
+        # unpack the grid values
+        grid = grid.reshape((-1, 1)) >> np.array([i for i in range(0, 8, 8 // elems_per_byte)], dtype=np.uint8).reshape((1, elems_per_byte))
+        grid = (grid & ((1 << bits_per_elem) - 1)).reshape((-1, 1))
+        grid_map = np.array(cls.grid_map, dtype=np.float32).reshape((1, -1))
+        grid = np.take_along_axis(grid_map, grid, axis=-1)
+        cls.grid = grid.reshape((1, 1, *cls.grid_shape))
+
+    @classmethod
+    @abstractmethod
+    def quantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        raise NotImplementedError
+
+    @classmethod
+    @abstractmethod
+    def dequantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        raise NotImplementedError
+
+    @classmethod
+    def quantize_rows(cls, rows: np.ndarray) -> np.ndarray:
+        rows = rows.astype(np.float32, copy=False)
+        shape = rows.shape
+        n_blocks = rows.size // cls.block_size
+        blocks = rows.reshape((n_blocks, cls.block_size))
+        blocks = cls.quantize_blocks(blocks)
+        assert blocks.dtype == np.uint8
+        assert blocks.shape[-1] == cls.type_size
+        return blocks.reshape(cls.__shape_to_bytes(shape))
+
+    @classmethod
+    def dequantize_rows(cls, rows: np.ndarray) -> np.ndarray:
+        rows = rows.view(np.uint8)
+        shape = rows.shape
+        n_blocks = rows.size // cls.type_size
+        blocks = rows.reshape((n_blocks, cls.type_size))
+        blocks = cls.dequantize_blocks(blocks)
+        assert blocks.dtype == np.float32
+        assert blocks.shape[-1] == cls.block_size
+        return blocks.reshape(cls.__shape_from_bytes(shape))
+
+    @classmethod
+    def __shape_to_bytes(cls, shape: Sequence[int]):
+        return quant_shape_to_byte_shape(shape, cls.qtype)
+
+    @classmethod
+    def __shape_from_bytes(cls, shape: Sequence[int]):
+        return quant_shape_from_byte_shape(shape, cls.qtype)
+
+    @classmethod
+    def __quantize_array(cls, array: np.ndarray) -> np.ndarray:
+        return _apply_over_grouped_rows(cls.quantize_rows, arr=array, otype=np.uint8, oshape=cls.__shape_to_bytes(array.shape))
+
+    @classmethod
+    def __dequantize_array(cls, array: np.ndarray) -> np.ndarray:
+        cls.init_grid()
+        return _apply_over_grouped_rows(cls.dequantize_rows, arr=array, otype=np.float32, oshape=cls.__shape_from_bytes(array.shape))
+
+    @classmethod
+    def __quantize_lazy(cls, lazy_tensor: LazyNumpyTensor, /) -> Any:
+        pass
+
+    @classmethod
+    def __dequantize_lazy(cls, lazy_tensor: LazyNumpyTensor, /) -> Any:
+        pass
+
+    @classmethod
+    def can_quantize(cls, tensor: np.ndarray | LazyNumpyTensor) -> bool:
+        return tensor.shape[-1] % cls.block_size == 0
+
+    @classmethod
+    def quantize(cls, tensor: np.ndarray | LazyNumpyTensor) -> np.ndarray:
+        if not cls.can_quantize(tensor):
+            raise QuantError(f"Can't quantize tensor with shape {tensor.shape} to {cls.qtype.name}")
+        if isinstance(tensor, LazyNumpyTensor):
+            return cls.__quantize_lazy(tensor)
+        else:
+            return cls.__quantize_array(tensor)
+
+    @classmethod
+    def dequantize(cls, tensor: np.ndarray | LazyNumpyTensor) -> np.ndarray:
+        if isinstance(tensor, LazyNumpyTensor):
+            return cls.__dequantize_lazy(tensor)
+        else:
+            return cls.__dequantize_array(tensor)
+
+
+class BF16(__Quant, qtype=GGMLQuantizationType.BF16):
+    @classmethod
+    # same as ggml_compute_fp32_to_bf16 in ggml-impl.h
+    def quantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        n = blocks.view(np.uint32)
+        # force nan to quiet
+        n = np.where((n & 0x7fffffff) > 0x7f800000, (n & np.uint32(0xffff0000)) | np.uint32(64 << 16), n)
+        # round to nearest even
+        n = (np.uint64(n) + (0x7fff + ((n >> 16) & 1))) >> 16
+        return n.astype(np.uint16).view(np.uint8)
+
+    @classmethod
+    def dequantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        return (blocks.view(np.int16).astype(np.int32) << 16).view(np.float32)
+
+
+class Q4_0(__Quant, qtype=GGMLQuantizationType.Q4_0):
+    @classmethod
+    def quantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        n_blocks = blocks.shape[0]
+
+        imax = abs(blocks).argmax(axis=-1, keepdims=True)
+        max = np.take_along_axis(blocks, imax, axis=-1)
+
+        d = max / -8
+        with np.errstate(divide="ignore"):
+            id = np.where(d == 0, 0, 1 / d)
+        qs = np.trunc((blocks * id) + np.float32(8.5), dtype=np.float32).astype(np.uint8).clip(0, 15)
+
+        qs = qs.reshape((n_blocks, 2, cls.block_size // 2))
+        qs = qs[..., 0, :] | (qs[..., 1, :] << np.uint8(4))
+
+        d = d.astype(np.float16).view(np.uint8)
+
+        return np.concatenate([d, qs], axis=-1)
+
+    @classmethod
+    def dequantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        n_blocks = blocks.shape[0]
+
+        d, qs = np.hsplit(blocks, [2])
+
+        d = d.view(np.float16).astype(np.float32)
+
+        qs = qs.reshape((n_blocks, -1, 1, cls.block_size // 2)) >> np.array([0, 4], dtype=np.uint8).reshape((1, 1, 2, 1))
+        qs = (qs & np.uint8(0x0F)).reshape((n_blocks, -1)).astype(np.int8) - np.int8(8)
+
+        return (d * qs.astype(np.float32))
+
+
+class Q4_1(__Quant, qtype=GGMLQuantizationType.Q4_1):
+    @classmethod
+    def quantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        n_blocks = blocks.shape[0]
+
+        max = blocks.max(axis=-1, keepdims=True)
+        min = blocks.min(axis=-1, keepdims=True)
+
+        d = (max - min) / 15
+        with np.errstate(divide="ignore"):
+            id = np.where(d == 0, 0, 1 / d)
+        qs = np.trunc((blocks - min) * id + np.float32(0.5), dtype=np.float32).astype(np.uint8).clip(0, 15)
+
+        qs = qs.reshape((n_blocks, 2, cls.block_size // 2))
+        qs = qs[..., 0, :] | (qs[..., 1, :] << np.uint8(4))
+
+        d = d.astype(np.float16).view(np.uint8)
+        m = min.astype(np.float16).view(np.uint8)
+
+        return np.concatenate([d, m, qs], axis=-1)
+
+    @classmethod
+    def dequantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        n_blocks = blocks.shape[0]
+
+        d, rest = np.hsplit(blocks, [2])
+        m, qs = np.hsplit(rest, [2])
+
+        d = d.view(np.float16).astype(np.float32)
+        m = m.view(np.float16).astype(np.float32)
+
+        qs = qs.reshape((n_blocks, -1, 1, cls.block_size // 2)) >> np.array([0, 4], dtype=np.uint8).reshape((1, 1, 2, 1))
+        qs = (qs & np.uint8(0x0F)).reshape((n_blocks, -1)).astype(np.float32)
+
+        return (d * qs) + m
+
+
+class Q5_0(__Quant, qtype=GGMLQuantizationType.Q5_0):
+    @classmethod
+    def quantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        n_blocks = blocks.shape[0]
+
+        imax = abs(blocks).argmax(axis=-1, keepdims=True)
+        max = np.take_along_axis(blocks, imax, axis=-1)
+
+        d = max / -16
+        with np.errstate(divide="ignore"):
+            id = np.where(d == 0, 0, 1 / d)
+        q = np.trunc((blocks * id) + np.float32(16.5), dtype=np.float32).astype(np.uint8).clip(0, 31)
+
+        qs = q.reshape((n_blocks, 2, cls.block_size // 2))
+        qs = (qs[..., 0, :] & np.uint8(0x0F)) | (qs[..., 1, :] << np.uint8(4))
+
+        qh = np.packbits(q.reshape((n_blocks, 1, 32)) >> np.uint8(4), axis=-1, bitorder="little").reshape(n_blocks, 4)
+
+        d = d.astype(np.float16).view(np.uint8)
+
+        return np.concatenate([d, qh, qs], axis=-1)
+
+    @classmethod
+    def dequantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        n_blocks = blocks.shape[0]
+
+        d, rest = np.hsplit(blocks, [2])
+        qh, qs = np.hsplit(rest, [4])
+
+        d = d.view(np.float16).astype(np.float32)
+        qh = qh.view(np.uint32)
+
+        qh = qh.reshape((n_blocks, 1)) >> np.array([i for i in range(32)], dtype=np.uint32).reshape((1, 32))
+        ql = qs.reshape((n_blocks, -1, 1, cls.block_size // 2)) >> np.array([0, 4], dtype=np.uint8).reshape((1, 1, 2, 1))
+        qh = (qh & np.uint32(0x01)).astype(np.uint8)
+        ql = (ql & np.uint8(0x0F)).reshape((n_blocks, -1))
+
+        qs = (ql | (qh << np.uint8(4))).astype(np.int8) - np.int8(16)
+
+        return (d * qs.astype(np.float32))
+
+
+class Q5_1(__Quant, qtype=GGMLQuantizationType.Q5_1):
+    @classmethod
+    def quantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        n_blocks = blocks.shape[0]
+
+        max = blocks.max(axis=-1, keepdims=True)
+        min = blocks.min(axis=-1, keepdims=True)
+
+        d = (max - min) / 31
+        with np.errstate(divide="ignore"):
+            id = np.where(d == 0, 0, 1 / d)
+        q = np.trunc((blocks - min) * id + np.float32(0.5), dtype=np.float32).astype(np.uint8).clip(0, 31)
+
+        qs = q.reshape((n_blocks, 2, cls.block_size // 2))
+        qs = (qs[..., 0, :] & np.uint8(0x0F)) | (qs[..., 1, :] << np.uint8(4))
+
+        qh = np.packbits(q.reshape((n_blocks, 1, 32)) >> np.uint8(4), axis=-1, bitorder="little").reshape(n_blocks, 4)
+
+        d = d.astype(np.float16).view(np.uint8)
+        m = min.astype(np.float16).view(np.uint8)
+
+        return np.concatenate([d, m, qh, qs], axis=-1)
+
+    @classmethod
+    def dequantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        n_blocks = blocks.shape[0]
+
+        d, rest = np.hsplit(blocks, [2])
+        m, rest = np.hsplit(rest, [2])
+        qh, qs = np.hsplit(rest, [4])
+
+        d = d.view(np.float16).astype(np.float32)
+        m = m.view(np.float16).astype(np.float32)
+        qh = qh.view(np.uint32)
+
+        qh = qh.reshape((n_blocks, 1)) >> np.array([i for i in range(32)], dtype=np.uint32).reshape((1, 32))
+        ql = qs.reshape((n_blocks, -1, 1, cls.block_size // 2)) >> np.array([0, 4], dtype=np.uint8).reshape((1, 1, 2, 1))
+        qh = (qh & np.uint32(0x01)).astype(np.uint8)
+        ql = (ql & np.uint8(0x0F)).reshape((n_blocks, -1))
+
+        qs = (ql | (qh << np.uint8(4))).astype(np.float32)
+
+        return (d * qs) + m
+
+
+class Q8_0(__Quant, qtype=GGMLQuantizationType.Q8_0):
+    @classmethod
+    # Implementation of Q8_0 with bit-exact same results as reference implementation in ggml-quants.c
+    def quantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+
+        d = abs(blocks).max(axis=1, keepdims=True) / 127
+        with np.errstate(divide="ignore"):
+            id = np.where(d == 0, 0, 1 / d)
+        qs = np_roundf(blocks * id)
+
+        # (n_blocks, 2)
+        d = d.astype(np.float16).view(np.uint8)
+        # (n_blocks, block_size)
+        qs = qs.astype(np.int8).view(np.uint8)
+
+        return np.concatenate([d, qs], axis=1)
+
+    @classmethod
+    def dequantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        d, x = np.split(blocks, [2], axis=1)
+        d = d.view(np.float16).astype(np.float32)
+        x = x.view(np.int8).astype(np.float32)
+
+        return (x * d)
+
+
+class Q2_K(__Quant, qtype=GGMLQuantizationType.Q2_K):
+    @classmethod
+    def dequantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        n_blocks = blocks.shape[0]
+
+        scales, rest = np.hsplit(blocks, [QK_K // 16])
+        qs, rest = np.hsplit(rest, [QK_K // 4])
+        d, dmin = np.hsplit(rest, [2])
+
+        d = d.view(np.float16).astype(np.float32)
+        dmin = dmin.view(np.float16).astype(np.float32)
+
+        # (n_blocks, 16, 1)
+        dl = (d * (scales & 0xF).astype(np.float32)).reshape((n_blocks, QK_K // 16, 1))
+        ml = (dmin * (scales >> 4).astype(np.float32)).reshape((n_blocks, QK_K // 16, 1))
+
+        shift = np.array([0, 2, 4, 6], dtype=np.uint8).reshape((1, 1, 4, 1))
+
+        qs = (qs.reshape((n_blocks, -1, 1, 32)) >> shift) & np.uint8(3)
+
+        qs = qs.reshape((n_blocks, QK_K // 16, 16)).astype(np.float32)
+
+        qs = dl * qs - ml
+
+        return qs.reshape((n_blocks, -1))
+
+
+class Q3_K(__Quant, qtype=GGMLQuantizationType.Q3_K):
+    @classmethod
+    def dequantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        n_blocks = blocks.shape[0]
+
+        hmask, rest = np.hsplit(blocks, [QK_K // 8])
+        qs, rest = np.hsplit(rest, [QK_K // 4])
+        scales, d = np.hsplit(rest, [12])
+
+        d = d.view(np.float16).astype(np.float32)
+
+        # The scales are packed at 6-bit each in this pattern:
+        #  0: IIIIAAAA
+        #  1: JJJJBBBB
+        #  2: KKKKCCCC
+        #  3: LLLLDDDD
+        #  4: MMMMEEEE
+        #  5: NNNNFFFF
+        #  6: OOOOGGGG
+        #  7: PPPPHHHH
+        #  8: MMIIEEAA
+        #  9: NNJJFFBB
+        # 10: OOKKGGCC
+        # 11: PPLLHHDD
+        lscales, hscales = np.hsplit(scales, [8])
+        lscales = lscales.reshape((n_blocks, 1, 8)) >> np.array([0, 4], dtype=np.uint8).reshape((1, 2, 1))
+        lscales = lscales.reshape((n_blocks, 16))
+        hscales = hscales.reshape((n_blocks, 1, 4)) >> np.array([0, 2, 4, 6], dtype=np.uint8).reshape((1, 4, 1))
+        hscales = hscales.reshape((n_blocks, 16))
+        scales = (lscales & np.uint8(0x0F)) | ((hscales & np.uint8(0x03)) << np.uint8(4))
+        scales = (scales.astype(np.int8) - np.int8(32)).astype(np.float32)
+
+        dl = (d * scales).reshape((n_blocks, 16, 1))
+
+        ql = qs.reshape((n_blocks, -1, 1, 32)) >> np.array([0, 2, 4, 6], dtype=np.uint8).reshape((1, 1, 4, 1))
+        qh = hmask.reshape(n_blocks, -1, 1, 32) >> np.array([i for i in range(8)], dtype=np.uint8).reshape((1, 1, 8, 1))
+        ql = ql.reshape((n_blocks, 16, QK_K // 16)) & np.uint8(3)
+        qh = (qh.reshape((n_blocks, 16, QK_K // 16)) & np.uint8(1))
+        qh = qh ^ np.uint8(1)  # strangely, the offset is zero when the bitmask is 1
+        q = (ql.astype(np.int8) - (qh << np.uint8(2)).astype(np.int8)).astype(np.float32)
+
+        return (dl * q).reshape((n_blocks, QK_K))
+
+
+class Q4_K(__Quant, qtype=GGMLQuantizationType.Q4_K):
+    K_SCALE_SIZE = 12
+
+    @staticmethod
+    def get_scale_min(scales: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        n_blocks = scales.shape[0]
+        scales = scales.view(np.uint8)
+        ### Unpacking the following: ###
+        #  0 EEAAAAAA
+        #  1 FFBBBBBB
+        #  2 GGCCCCCC
+        #  3 HHDDDDDD
+        #  4 eeaaaaaa
+        #  5 ffbbbbbb
+        #  6 ggcccccc
+        #  7 hhdddddd
+        #  8 eeeeEEEE
+        #  9 ffffFFFF
+        # 10 ggggGGGG
+        # 11 hhhhHHHH
+        scales = scales.reshape((n_blocks, 3, 4))
+        d, m, m_d = np.split(scales, 3, axis=-2)
+
+        sc = np.concatenate([d & 0x3F, (m_d & 0x0F) | ((d >> 2) & 0x30)], axis=-1)
+        min = np.concatenate([m & 0x3F, (m_d >> 4) | ((m >> 2) & 0x30)], axis=-1)
+
+        return (sc.reshape((n_blocks, 8)), min.reshape((n_blocks, 8)))
+
+    @classmethod
+    def dequantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        n_blocks = blocks.shape[0]
+
+        d, rest = np.hsplit(blocks, [2])
+        dmin, rest = np.hsplit(rest, [2])
+        scales, qs = np.hsplit(rest, [cls.K_SCALE_SIZE])
+
+        d = d.view(np.float16).astype(np.float32)
+        dmin = dmin.view(np.float16).astype(np.float32)
+
+        sc, m = Q4_K.get_scale_min(scales)
+
+        d = (d * sc.astype(np.float32)).reshape((n_blocks, -1, 1))
+        dm = (dmin * m.astype(np.float32)).reshape((n_blocks, -1, 1))
+
+        qs = qs.reshape((n_blocks, -1, 1, 32)) >> np.array([0, 4], dtype=np.uint8).reshape((1, 1, 2, 1))
+        qs = (qs & np.uint8(0x0F)).reshape((n_blocks, -1, 32)).astype(np.float32)
+
+        return (d * qs - dm).reshape((n_blocks, QK_K))
+
+
+class Q5_K(__Quant, qtype=GGMLQuantizationType.Q5_K):
+    @classmethod
+    def dequantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        n_blocks = blocks.shape[0]
+
+        d, rest = np.hsplit(blocks, [2])
+        dmin, rest = np.hsplit(rest, [2])
+        scales, rest = np.hsplit(rest, [Q4_K.K_SCALE_SIZE])
+        qh, qs = np.hsplit(rest, [QK_K // 8])
+
+        d = d.view(np.float16).astype(np.float32)
+        dmin = dmin.view(np.float16).astype(np.float32)
+
+        sc, m = Q4_K.get_scale_min(scales)
+
+        d = (d * sc.astype(np.float32)).reshape((n_blocks, -1, 1))
+        dm = (dmin * m.astype(np.float32)).reshape((n_blocks, -1, 1))
+
+        ql = qs.reshape((n_blocks, -1, 1, 32)) >> np.array([0, 4], dtype=np.uint8).reshape((1, 1, 2, 1))
+        qh = qh.reshape((n_blocks, -1, 1, 32)) >> np.array([i for i in range(8)], dtype=np.uint8).reshape((1, 1, 8, 1))
+        ql = (ql & np.uint8(0x0F)).reshape((n_blocks, -1, 32))
+        qh = (qh & np.uint8(0x01)).reshape((n_blocks, -1, 32))
+        q = (ql | (qh << np.uint8(4))).astype(np.float32)
+
+        return (d * q - dm).reshape((n_blocks, QK_K))
+
+
+class Q6_K(__Quant, qtype=GGMLQuantizationType.Q6_K):
+    @classmethod
+    def dequantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        n_blocks = blocks.shape[0]
+
+        ql, rest = np.hsplit(blocks, [QK_K // 2])
+        qh, rest = np.hsplit(rest, [QK_K // 4])
+        scales, d = np.hsplit(rest, [QK_K // 16])
+
+        scales = scales.view(np.int8).astype(np.float32)
+        d = d.view(np.float16).astype(np.float32)
+        d = (d * scales).reshape((n_blocks, QK_K // 16, 1))
+
+        ql = ql.reshape((n_blocks, -1, 1, 64)) >> np.array([0, 4], dtype=np.uint8).reshape((1, 1, 2, 1))
+        ql = (ql & np.uint8(0x0F)).reshape((n_blocks, -1, 32))
+        qh = qh.reshape((n_blocks, -1, 1, 32)) >> np.array([0, 2, 4, 6], dtype=np.uint8).reshape((1, 1, 4, 1))
+        qh = (qh & np.uint8(0x03)).reshape((n_blocks, -1, 32))
+        q = (ql | (qh << np.uint8(4))).astype(np.int8) - np.int8(32)
+        q = q.reshape((n_blocks, QK_K // 16, -1)).astype(np.float32)
+
+        return (d * q).reshape((n_blocks, QK_K))
+
+
+class TQ1_0(__Quant, qtype=GGMLQuantizationType.TQ1_0):
+    @classmethod
+    def quantize_blocks(cls, blocks: 

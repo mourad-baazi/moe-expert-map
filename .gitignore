@@ -7,3 +7,4 @@ llama.cpp/
 build/
 toolchain/
 build-tmp/
+results/traces_v2/*.csv

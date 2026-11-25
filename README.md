@@ -46,20 +46,48 @@ This project asks whether we can do better by treating the PC as a memory hierar
 3. **Predict** which experts the next layer will need and load them ahead of time.
 4. **Benchmark** tokens/second against llama.cpp's default `--n-cpu-moe` split.
 
-## First results (small pilot, ~1,000 tokens)
+## The expert map (56,760 tokens, 4 domains)
 
-Inkling-2-Mini UD-Q2_K_XL, CPU-only llama.cpp (baseline generation speed: **1.8 tokens/s** on a Ryzen 5 5600X).
-24 physical layers; layers 6–17 run 3 times, so each token makes 48 layer passes, each picking 8 of 128 experts.
+Inkling-2-Mini UD-Q2_K_XL has 24 physical layers; layers 6–17 run 3 times, so each token makes 48 layer passes,
+each picking 8 of 128 experts. `tools/moe-trace` recorded every pick for about 12–19K tokens per domain:
 
-| Question | Pilot answer |
-|---|---|
-| Skew | The top 10% of experts handle **36%** of picks; the top 25% handle **60%** (even usage would be 10% / 25%) |
-| Domains | Code and chat share only **9%** of their favourite experts per layer; chat and Arabic chat share **44%** |
-| Prediction | A simple co-occurrence table guesses **48%** of the next layer's experts (most-popular: 27%, random: 6%) |
-| Loop reuse | In looped layers, the same token reuses **4.8 of 8** experts from one pass to the next (random: 0.5); pass 1 to pass 3: 3.8 |
+- **chat, math, Arabic:** written by Inkling itself from 16 varied prompts each (`scripts/gen_corpus.py`); the model
+  thinks in English before answering, so the Arabic set is English reasoning plus Arabic answers
+- **code:** Python from llama.cpp's `gguf-py` (MIT licensed, `data/corpus/code.LICENSE.txt`)
 
-These numbers come from a tiny sample, are measured on a 2-bit quantized model, and the predictor is trained
-and tested on the same texts (even vs odd positions), so they are optimistic. They need confirming on much more text.
+| Question | Pilot (~1,000 tokens) | **Full dataset (56,760 tokens)** |
+|---|---|---|
+| Skew: picks handled by the hottest 10% / 25% of experts per layer (even would be 10% / 25%) | 36% / 60% | **32% / 54%** |
+| Domains: shared favourite experts (top 32 per layer), code vs chat | 9% | **5%** |
+| Domains: chat vs Arabic chat | 44% | **58%** |
+| Prediction: next layer's experts guessed by a co-occurrence table (random 6%) | 48% | **44%** |
+| Loop reuse: experts repeated by the same token, pass 1→2 / 2→3 (random 0.5 of 8) | 4.8 / – | **4.8 / 4.6** of 8 |
+
+![expert usage per layer pass](docs/heatmap_all.png)
+
+**Within one domain** the hottest 20% of experts handle about 65–70% of the work, so a placement that adapts to the
+task can keep far more of the work on the GPU than a fixed one:
+
+![coverage](docs/coverage.png)
+
+Code and math light up very different experts from chat and Arabic chat (layer 12, first pass shown):
+
+![domains](docs/heatmap_domains.png)
+
+Every looped layer reuses most of its experts from one pass to the next, which is what makes loop-aware placement work:
+
+![loop reuse](docs/loop_reuse.png)
+
+Caveats: measured on a 2-bit model; the next-layer predictor is trained and tested on alternating positions of the same
+texts, so 44% is an upper estimate for unseen text.
+
+### Lesson learned: verify the tracer
+
+A faster tracer built on the official prebuilt CUDA DLLs (`tools/moe-trace/moe-trace-gpu.cpp`, C API only) recorded
+experts `0–7` with `NaN` weights for layer passes 18 and later, for every token. Its CPU and GPU runs agreed 100%,
+but only because both were broken; the source-built tracer (`moe-trace`) records valid routing and matches it 99% on
+layers 0–17. Normal inference is not affected (19/20 on a fact check, `scripts/fact_check.ps1`). All results here use
+`moe-trace`, and `scripts/analyze.py` and `scripts/plot.py` now drop and report any row with NaN weights.
 
 ## Result 1: loop-aware expert placement (+52% over llama.cpp's default)
 
@@ -173,12 +201,12 @@ used most. Target on this PC: **25–40 tokens/s** for Inkling 2 Mini with long 
 
 ### Next
 
-- [ ] Larger dataset (10k+ tokens per domain) to confirm the pilot numbers, plus heatmaps
+- [x] Larger dataset (56,760 tokens) confirms the pilot numbers; heatmaps in `docs/`
 - [ ] Placement simulator: predict tokens/s for any placement from traces and hardware bandwidths
 - [ ] Per-expert hot/cold placement inside llama.cpp (hot experts of every layer on GPU, cold ones in RAM); estimated 1.4–1.6×
 - [ ] Loop expert cache: keep experts used in pass 1 ready for passes 2 and 3
 - [ ] Usage-aware precision: cold experts at very low bit-width (e.g. NanoQuant-style), hot ones at higher quality
-- [ ] Report the tool-call bug to llama.cpp with the reproduction script
+- [ ] Report the tool-call bug and the eval-callback NaN routing to llama.cpp with reproduction scripts
 
 ## Hardware used
 

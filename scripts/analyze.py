@@ -12,6 +12,9 @@ import argparse, csv, json, math, os, sys
 from collections import Counter, defaultdict
 
 
+BAD_ROWS = Counter()  # file -> rows dropped because the router weights were NaN (broken trace)
+
+
 def load(path):
     rows = defaultdict(dict)  # pos -> layer -> list of experts
     with open(path, newline="", encoding="utf-8") as f:
@@ -19,6 +22,9 @@ def load(path):
         head = next(r)
         k = sum(1 for h in head if h.startswith("e"))
         for row in r:
+            if any(w.lower() == "nan" for w in row[2 + k:2 + 2 * k]):
+                BAD_ROWS[path] += 1
+                continue
             pos, layer = int(row[0]), int(row[1])
             rows[pos][layer] = [int(x) for x in row[2:2 + k]]
     return rows, k
@@ -104,8 +110,11 @@ def main():
                         base_hits += len(popular & set(nxt))
                         tested += len(nxt)
 
+    if BAD_ROWS:
+        print("WARNING: dropped rows with NaN router weights (trace is broken):", dict(BAD_ROWS))
     summary = {
         "tokens": {d: len(r) for d, r in domains.items()},
+        "dropped_nan_rows": dict(BAD_ROWS),
         "layers": len(layers), "experts_per_token": k, "experts": a.experts,
         "skew_mean": {m: sum(s[m] for s in skew.values()) / len(skew) for m in ("top10", "top25", "top50", "evenness", "unused")},
         "domain_overlap_jaccard_top%d" % a.top: overlap,
