@@ -1,0 +1,196 @@
+# moe-expert-map
+
+**Can a smarter placement of Mixture-of-Experts weights make big models run faster on ordinary PCs?**
+
+Modern open models like Inkling 2 Mini (26.4B parameters, 3.4B active) are *Mixture-of-Experts*:
+each token only uses 8 of 128 experts per layer. On a consumer PC the model does not fit in GPU
+memory, so tools like llama.cpp keep the shared layers on the GPU and all experts in system RAM.
+
+## Headline
+
+On a 6 GB RTX 2060 + Ryzen 5 5600X, Inkling 2 Mini goes from **2.4 tokens/s (CPU only)** to **17–19 tokens/s**
+with up to **64K context**. The key trick is putting the experts of the layers that run three times per token on the
+GPU (loop-aware placement), which is **1.5× faster than llama.cpp's default offload** for the same VRAM.
+
+| What | Where |
+|---|---|
+| Expert-usage logger for llama.cpp | `tools/moe-trace` |
+| Loop-aware placement benchmark | Result 1, `scripts/bench.ps1` |
+| VRAM tuning for speed and 64K context | Result 2, `scripts/gen_speed.ps1` |
+| Why speculative decoding hurts MoE offload | Result 2 |
+| Chat template fix and a llama.cpp tool-call bug | "Chat with it" |
+
+## Quick start (Windows)
+
+1. Download the official llama.cpp CUDA build (b12622 or later) and unzip it to `toolchain/llama-cuda`.
+2. Download `Mainline_Support/Inkling-2-Mini-UD-Q2_K_XL.gguf_file` from
+   [unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) and save it as
+   `models/Inkling-2-Mini-UD-Q2_K_XL-mainline.gguf`.
+3. In Git Bash run `./chat.sh` (or `./chat.sh long` for 64K context) and open http://localhost:8080.
+
+## The idea
+
+This project asks whether we can do better by treating the PC as a memory hierarchy:
+
+| Tier | Example (author's PC) | Bandwidth | Size |
+|---|---|---|---|
+| GPU VRAM | RTX 2060 | ~336 GB/s | 6 GB |
+| System RAM | DDR4 | ~45 GB/s | 16 GB |
+| NVMe SSD | Crucial P3 | ~3.5 GB/s | 1 TB |
+
+## Plan
+
+1. **Measure** which experts each token uses, per layer, across different kinds of text
+   (code, chat, math, other languages). Are some experts "hot" and others almost never used?
+2. **Place** hot experts on the GPU, warm ones in RAM, cold ones on the SSD.
+3. **Predict** which experts the next layer will need and load them ahead of time.
+4. **Benchmark** tokens/second against llama.cpp's default `--n-cpu-moe` split.
+
+## First results (small pilot, ~1,000 tokens)
+
+Inkling-2-Mini UD-Q2_K_XL, CPU-only llama.cpp (baseline generation speed: **1.8 tokens/s** on a Ryzen 5 5600X).
+24 physical layers; layers 6–17 run 3 times, so each token makes 48 layer passes, each picking 8 of 128 experts.
+
+| Question | Pilot answer |
+|---|---|
+| Skew | The top 10% of experts handle **36%** of picks; the top 25% handle **60%** (even usage would be 10% / 25%) |
+| Domains | Code and chat share only **9%** of their favourite experts per layer; chat and Arabic chat share **44%** |
+| Prediction | A simple co-occurrence table guesses **48%** of the next layer's experts (most-popular: 27%, random: 6%) |
+| Loop reuse | In looped layers, the same token reuses **4.8 of 8** experts from one pass to the next (random: 0.5); pass 1 to pass 3: 3.8 |
+
+These numbers come from a tiny sample, are measured on a 2-bit quantized model, and the predictor is trained
+and tested on the same texts (even vs odd positions), so they are optimistic. They need confirming on much more text.
+
+## Result 1: loop-aware expert placement (+52% over llama.cpp's default)
+
+Layers 6–17 of Inkling 2 Mini run three times per token, so their experts are read three times as often.
+llama.cpp's `--n-cpu-moe` always moves the *last* layers' experts to the GPU. Moving the *looped* layers' experts
+instead gives a big speedup for the same amount of VRAM.
+
+Generation speed (tokens/s, 64 tokens, mean of 3 runs), RTX 2060 6 GB + Ryzen 5 5600X, llama.cpp b12622:
+
+| Setup | Expert layers on GPU | tokens/s |
+|---|---|---|
+| CPU only | none | 2.4 |
+| GPU, all experts in RAM (`-ngl 99 --n-cpu-moe 99`) | none | 9.4 |
+| GPU, llama.cpp default (`--n-cpu-moe 14`) | 14–23 (10 layers) | 11.5 ± 2.7 |
+| **GPU, loop-aware** (`-ot "blk\.([8-9]\|1[0-7])\.ffn_.*_exps=CUDA0;exps=CPU"`) | **8–17 (10 looped layers)** | **17.5 ± 0.9** |
+
+That is **7.2× faster than CPU only** and **1.5× faster than the default offload**, with no change to the model or its output.
+With 12 expert layers on the GPU both setups slow down (6 GB VRAM is over-full), so 10 layers is the sweet spot on this card.
+Reproduce with `scripts\bench.ps1`.
+
+## Result 2: freeing VRAM for more experts and longer context
+
+Where the 6 GB went at 8K context (default settings): weights 4.0 GB, **compute buffer 1.95 GB**, context memory 0.5 GB.
+Inkling 2 Mini uses sliding-window attention (1,024 tokens) in 40 of its 48 layer passes, so only 8 passes keep
+memory that grows with context: about 32 KB per token at 16-bit, 16 KB at 8-bit, 9 KB at 4-bit.
+
+- Smaller processing chunks (`-ub 128 -b 128`) shrink the compute buffer from 1.95 GB to 1.23 GB.
+- 8-bit or 4-bit context memory (`-fa on -ctk q8_0 -ctv q8_0`, or `q4_0`) halves or quarters the growing part.
+- The freed VRAM holds more looped expert layers.
+
+Generation speed, 128 tokens, short prompt (`scripts\gen_speed.ps1`):
+
+| Context | Setup | tokens/s |
+|---|---|---|
+| 8K | 9 looped layers, default chunks (previous) | 18.0 |
+| 8K | **12 looped layers, chunks 128, 8-bit context** | **20.6** |
+| 32K | 11 looped layers, chunks 128, 4-bit context | 18.9 |
+| 64K | **10 looped layers, chunks 128, 4-bit context** | **18.8** |
+
+When VRAM overflows (for example 12 layers with 16-bit context memory) speed falls to ~12 tokens/s, so each setting is
+right at the edge of 6 GB. These speeds are measured with an almost empty context; they drop as a long conversation fills it.
+
+Inside `llama-server` a little more VRAM is used, so 10 looped layers is the stable maximum there (measured over real
+chat requests with `scripts\server_test.ps1`):
+
+| Server mode | Context | Context memory | tokens/s |
+|---|---|---|---|
+| `./chat.sh` | 8K | 8-bit | 16.8–18.7 |
+| `./chat.sh long` | 64K | 4-bit | 17.0–19.0 |
+
+**Speculative decoding:** the official DSpark drafter (`dspark-Inkling-2-Mini-Q8_0.gguf`) does not load in mainline
+llama.cpp b12622: its `markov_w1` uses the padded vocabulary (201,024) while mainline expects 200,058.
+Its model card points to the Unsloth llama.cpp fork for now.
+
+Tested with the Unsloth fork (b12588-mix-c0c3de8) and the Unsloth-format UD-Q2_K_XL file, 8 looped expert layers on GPU,
+8K context, 8-bit context memory, same three prompts:
+
+| Setup | tokens/s | Draft acceptance |
+|---|---|---|
+| Unsloth fork, no draft | 11.7–13.5 | – |
+| Unsloth fork + DSpark draft (`--spec-draft-n-max 3`) | **6.4–7.2** | 43–64% (2.3–2.9 tokens per step) |
+| Mainline b12622, no draft, 10 looped layers (for comparison) | 16.8–18.7 | – |
+
+**Speculative decoding makes this setup ~2× slower even though half the guesses are accepted.** On a dense model, checking
+four guessed tokens reads the weights once, so it is almost free. In a Mixture-of-Experts model each guessed token picks its
+own 8 experts, so checking 4 tokens can mean reading up to 4× as many experts from RAM, and RAM bandwidth is exactly the
+bottleneck when experts live in system memory. The drafter also takes VRAM that would otherwise hold expert layers.
+Speculative decoding only pays off for MoE models when the experts being verified are already in fast memory.
+
+## Chat with it
+
+`./chat.sh` (Git Bash) starts `llama-server` with loop-aware placement and opens a chat page at http://localhost:8080.
+With an 8,192-token context, 9 looped expert layers on the GPU is the sweet spot on 6 GB: **~16–18 tokens/s** in real chats.
+
+**Template fix:** the chat template inside the GGUF never opens the model's turn (`add_generation_prompt` is ignored),
+so the model only produces an empty reply that repeats `<|content_invoke_tool_text|>`. `templates/inkling2-chat-fixed.jinja`
+adds the missing `<|message_model|>` and is passed with `--chat-template-file`.
+
+**Tool bug (llama.cpp b12622):** any chat request that includes tool definitions makes the model repeat
+`<|content_invoke_tool_text|>`, and **every later request on that server is broken too** until it restarts.
+It happens with the default placement as well, so it is not caused by loop-aware placement. The llama-server web page
+sends its built-in browser tools with every message, so turn them off once in the page (they are saved per browser):
+open http://localhost:8080, press F12, and run this in the Console, then reload:
+
+```js
+localStorage.setItem('LlamaUi.disabledToolCategories', JSON.stringify(['browser','custom','mcp','server']))
+```
+
+Reproduce: `powershell -File scripts\server_test.ps1 -Label test -Sequence "plain,tools,plain" -Extra "-ncmoe","99"`
+(plain requests work; the tools request and everything after it come back empty).
+
+## Progress and goals
+
+**Goal:** make large Mixture-of-Experts models genuinely usable on an ordinary gaming PC by treating
+GPU memory, system RAM and SSD as one memory hierarchy, and placing each part of the model where it is
+used most. Target on this PC: **25–40 tokens/s** for Inkling 2 Mini with long context, without changing the model.
+
+### Done
+
+| Milestone | Outcome |
+|---|---|
+| Portable build setup on Windows (no installs on C:) | `scripts/build.ps1`, w64devkit + CMake |
+| Expert-usage logger for llama.cpp | `tools/moe-trace` records experts and weights per token and layer |
+| Pilot expert map (~1,000 tokens, 4 domains) | Experts are skewed; code and chat use different experts; next-layer choices are predictable (48% vs 6% random) |
+| Discovery: looped layers reuse experts | 4.8 of 8 experts repeat between loop passes |
+| GPU offload | 2.4 → 9.4 tokens/s |
+| **Loop-aware placement** | **17.5 tokens/s vs 11.5** for llama.cpp's default with the same VRAM |
+| VRAM tuning (compute buffer, 8/4-bit context memory) | 64K context at the same speed (17–19 tokens/s in chat) |
+| Speculative decoding test (DSpark drafter) | 2× slower on MoE with experts in RAM; reason explained |
+| Chat setup | Fixed chat template; found and worked around a llama.cpp tool-call bug |
+
+### Next
+
+- [ ] Larger dataset (10k+ tokens per domain) to confirm the pilot numbers, plus heatmaps
+- [ ] Placement simulator: predict tokens/s for any placement from traces and hardware bandwidths
+- [ ] Per-expert hot/cold placement inside llama.cpp (hot experts of every layer on GPU, cold ones in RAM); estimated 1.4–1.6×
+- [ ] Loop expert cache: keep experts used in pass 1 ready for passes 2 and 3
+- [ ] Usage-aware precision: cold experts at very low bit-width (e.g. NanoQuant-style), hot ones at higher quality
+- [ ] Report the tool-call bug to llama.cpp with the reproduction script
+
+## Hardware used
+
+AMD Ryzen 5 5600X · 16 GB DDR4 · NVIDIA RTX 2060 6 GB · NVMe SSD · Windows 10
+
+## Related work
+
+- PowerInfer (Song et al., 2023): hot/cold neuron split between GPU and CPU
+- LLM in a Flash (Alizadeh et al., Apple, 2023): running models from flash storage
+- KTransformers: MoE experts on CPU, attention on GPU
+- SmallThinker (2025): a model designed for local hardware with expert prefetching
+
+## License
+
+MIT

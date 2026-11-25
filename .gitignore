@@ -1,0 +1,9 @@
+models/
+*.gguf
+data/raw/
+__pycache__/
+.venv/
+llama.cpp/
+build/
+toolchain/
+build-tmp/

@@ -1,0 +1,6 @@
+Problem: A train leaves a station at 9:00 and travels at 80 km/h. A second train leaves the same station at 10:30 on the same track and travels at 120 km/h. At what time does the second train catch the first?
+Solution: By 10:30 the first train has traveled 1.5 hours at 80 km/h, which is 120 km. The second train closes the gap at 120 - 80 = 40 km/h. Time to close 120 km is 120 / 40 = 3 hours. So the second train catches the first at 13:30.
+Problem: Solve for x: 3x^2 - 12x + 9 = 0.
+Solution: Divide by 3 to get x^2 - 4x + 3 = 0. This factors as (x - 1)(x - 3) = 0, so x = 1 or x = 3.
+Problem: What is the sum of the integers from 1 to 200?
+Solution: Using n(n + 1) / 2 with n = 200 gives 200 * 201 / 2 = 20100.

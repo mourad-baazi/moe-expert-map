@@ -1,0 +1,36 @@
+def merge_intervals(intervals):
+    """Merge overlapping intervals and return them sorted by start."""
+    if not intervals:
+        return []
+    intervals = sorted(intervals, key=lambda x: x[0])
+    merged = [list(intervals[0])]
+    for start, end in intervals[1:]:
+        last = merged[-1]
+        if start <= last[1]:
+            last[1] = max(last[1], end)
+        else:
+            merged.append([start, end])
+    return merged
+
+
+class LRUCache:
+    def __init__(self, capacity: int):
+        self.capacity = capacity
+        self.items = {}
+        self.order = []
+
+    def get(self, key):
+        if key not in self.items:
+            return -1
+        self.order.remove(key)
+        self.order.append(key)
+        return self.items[key]
+
+    def put(self, key, value):
+        if key in self.items:
+            self.order.remove(key)
+        elif len(self.items) >= self.capacity:
+            oldest = self.order.pop(0)
+            del self.items[oldest]
+        self.items[key] = value
+        self.order.append(key)
