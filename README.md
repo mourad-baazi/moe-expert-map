@@ -157,6 +157,31 @@ own 8 experts, so checking 4 tokens can mean reading up to 4× as many experts f
 bottleneck when experts live in system memory. The drafter also takes VRAM that would otherwise hold expert layers.
 Speculative decoding only pays off for MoE models when the experts being verified are already in fast memory.
 
+## Result 3: letting cold experts sleep for good (usage-aware expert pruning)
+
+Without changing llama.cpp, the only way to give each layer's *hot* experts more GPU room is to remove its cold ones.
+`scripts/prune_experts.py` ranks every layer's experts by the total routing weight they received across all loop
+passes in the 56,760-token traces, keeps the top K, and slices all per-expert tensors (`ffn_gate_up_exps`,
+`ffn_down_exps`, their scales, the router `ffn_gate_inp` and its bias `exp_probs_b`) to match. Tokens that would have
+picked a removed expert simply get the next best one. Smaller expert tensors let more looped layers sit on the GPU.
+
+Quality is measured on 40 prompts **not used for pruning** (`scripts/quality_eval.py`): greedy 64-token continuations
+compared token by token with the full model. A harmless change (8-bit context memory) is shown as the noise baseline.
+
+| Model | File size | Routing weight kept | Tokens identical to the full model (mean of 64) | Chat speed (8K, server) |
+|---|---|---|---|---|
+| Full, 128 experts | 8.5 GB | 100% | 64 (reference) | 17–19 tokens/s |
+| Full, 8-bit context memory (noise baseline) | 8.5 GB | 100% | 41.9 | 17–19 tokens/s |
+| **Pruned to 112 experts** | 7.6 GB | 96–99.6% per layer | 14.3 | **21–23 tokens/s** (13 GPU layers) |
+| Pruned to 96 experts | 6.7 GB | 89–98% per layer | 8.3 | 23–24 tokens/s (16 GPU layers) |
+
+**Verdict:** pruning buys **+20–30% speed but clearly changes the model**. Even the gentle 112-expert cut drifts from the
+original much sooner than the noise baseline. At 96 experts the model starts contradicting itself
+(*"1789. False, 1789 is the wrong year…"*). On the 20-question fact check both pruned models still score 19/20.
+The 1–4% of routing weight that cold experts carry matters more than the numbers suggest, so the lossless route
+(per-expert placement inside llama.cpp, keeping every expert) is the right next step. `./chat.sh lite` runs the
+112-expert model for anyone who prefers speed.
+
 ## Chat with it
 
 `./chat.sh` (Git Bash) starts `llama-server` with loop-aware placement and opens a chat page at http://localhost:8080.
@@ -203,6 +228,7 @@ used most. Target on this PC: **25–40 tokens/s** for Inkling 2 Mini with long 
 
 - [x] Larger dataset (56,760 tokens) confirms the pilot numbers; heatmaps in `docs/`
 - [ ] Placement simulator: predict tokens/s for any placement from traces and hardware bandwidths
+- [x] Usage-aware expert pruning: +20–30% speed, but measurable quality drift (Result 3)
 - [ ] Per-expert hot/cold placement inside llama.cpp (hot experts of every layer on GPU, cold ones in RAM); estimated 1.4–1.6×
 - [ ] Loop expert cache: keep experts used in pass 1 ready for passes 2 and 3
 - [ ] Usage-aware precision: cold experts at very low bit-width (e.g. NanoQuant-style), hot ones at higher quality
