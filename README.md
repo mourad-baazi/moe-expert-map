@@ -196,6 +196,39 @@ The 1–4% of routing weight that cold experts carry matters more than the numbe
   simple quantizer add 3–11% error. A proper requantization would need the original 16-bit weights and llama.cpp's
   own quantizer (`scripts/repack_cpu_experts.py` is kept for experiments).
 
+## Result 5: hot experts on the GPU (lossless, but the 6 GB wall holds)
+
+Idea: keep **all 128 experts**, but put the most-used experts of the CPU-side layers on the GPU too.
+llama.cpp b12622 already has a GPU **MoE cache** for CPU-resident experts (`--moe-cache-mib`). I added a
+**pinned mode** that fills it from the expert map instead of on the fly (`LLAMA_MOE_CACHE_PIN=file`,
+`scripts/make_pins.py`, patch in `patches/moe-cache-pin.patch`). On held-out tokens, 300 pins cover 40% of the CPU
+expert work and 500 pins cover 51%.
+
+Building it for CUDA without a CUDA toolkit: I built only llama, common and the server with MinGW from the same
+commit and loaded the **prebuilt CUDA ggml DLLs** (C API only). One fix was needed: open model files with llama's
+own C runtime (a `FILE *` from the other runtime gave "seek error"). The hybrid build matches the prebuilt speed
+exactly (21.5 tokens/s).
+
+Speed in llama-server (tokens/s, 300-token answers, 8K context, 12 threads, same answers in every row):
+
+| GPU layers (looped) | no cache | built-in cache, `--moe-cache-cpu-share 0.9` | pinned hot experts (mine) |
+|---|---|---|---|
+| 10 (8-17) | **21.5** | 21.6 (250 MiB) | n/a (no VRAM left) |
+| 8 (10-17) | 19.7 | 21.4 (800 MiB) | 19.2 (300 pins) |
+| 6 (10-15) | 18.0 | 21.5 (1300 MiB) | 18.2 (500 pins) |
+
+- **Lesson: the cache helps, but only as much as the VRAM it uses.** Moving VRAM from whole looped layers to a cache
+  gets the speed back (6 layers + cache = 10 layers, no cache), but never beats it. The looped layers are already
+  "hot" (each runs 3 times), so loop-aware placement is close to the best use of 6 GB.
+- **Static pins lose to the adaptive cache:** a single conversation reuses a small set of experts more than the whole
+  corpus does, so the cache's own recency/frequency policy wins. Each cached layer also adds a GPU sync per token.
+- Uploading misses over PCIe (the default `cpu-share 0`) is slower (17-18 tokens/s): an expert upload costs more
+  than computing it on the CPU.
+- Vulkan (`llama.cpp/build-vk`) runs this model at only 11.5 tokens/s on the RTX 2060 vs 21.5 with CUDA.
+
+So with this GPU and this file, **~21.5 tokens/s is the lossless ceiling**. Going further needs more VRAM, faster CPU
+kernels for the IQ1/IQ2 formats, or a requantized file (Result 4).
+
 ## Chat with it
 
 `./chat.sh` (Git Bash) starts `llama-server` with loop-aware placement and opens a chat page at http://localhost:8080.
@@ -243,8 +276,8 @@ used most. Target on this PC: **25–40 tokens/s** for Inkling 2 Mini with long 
 - [x] Larger dataset (56,760 tokens) confirms the pilot numbers; heatmaps in `docs/`
 - [ ] Placement simulator: predict tokens/s for any placement from traces and hardware bandwidths
 - [x] Usage-aware expert pruning: +20–30% speed, but measurable quality drift (Result 3)
-- [ ] Per-expert hot/cold placement inside llama.cpp (hot experts of every layer on GPU, cold ones in RAM); estimated 1.4–1.6×
-- [ ] Loop expert cache: keep experts used in pass 1 ready for passes 2 and 3
+- [x] Per-expert hot/cold placement: built-in MoE cache + my pinned mode tested; lossless but no gain over loop-aware placement on 6 GB (Result 5)
+- [ ] Faster CPU kernels for IQ1_S/IQ2_* experts (the measured bottleneck), or requantize from the 16-bit weights
 - [ ] Usage-aware precision: cold experts at very low bit-width (e.g. NanoQuant-style), hot ones at higher quality
 - [ ] Report the tool-call bug and the eval-callback NaN routing to llama.cpp with reproduction scripts
 

@@ -1,0 +1,138 @@
+diff --git a/src/llama-adapter.cpp b/src/llama-adapter.cpp
+index 824601e..5b79ede 100644
+--- a/src/llama-adapter.cpp
++++ b/src/llama-adapter.cpp
+@@ -430,7 +430,7 @@ static void llama_adapter_lora_init_impl(llama_model & model, FILE * file, llama
+ llama_adapter_lora * llama_adapter_lora_init(llama_model * model, const char * path_lora) {
+     LLAMA_LOG_INFO("%s: loading lora adapter from '%s' ...\n", __func__, path_lora);
+ 
+-    FILE * file = ggml_fopen(path_lora, "rb");
++    FILE * file = llama_fopen_local(path_lora, "rb");
+     if (!file) {
+         LLAMA_LOG_ERROR("%s: failed to open '%s': %s\n", __func__, path_lora, strerror(errno));
+         return nullptr;
+diff --git a/src/llama-impl.h b/src/llama-impl.h
+index 884dca6..87de240 100644
+--- a/src/llama-impl.h
++++ b/src/llama-impl.h
+@@ -109,3 +109,22 @@ std::string llama_format_tensor_shape(const struct ggml_tensor * t);
+ 
+ // arrays are rendered only until the result is longer than max_len
+ std::string gguf_kv_to_str(const struct gguf_context * ctx_gguf, int i, size_t max_len = SIZE_MAX);
++
++// fopen with this library's own C runtime: a FILE * from ggml_fopen belongs to ggml's C runtime, which can differ
++// when llama is built with another toolchain than the ggml backends it loads (e.g. MinGW llama + prebuilt CUDA ggml)
++#include <cstdio>
++#if defined(_WIN32)
++#include <string>
++#include <windows.h>
++static inline FILE * llama_fopen_local(const char * fname, const char * mode) {
++    auto wide = [](const char * s) {
++        int n = MultiByteToWideChar(CP_UTF8, 0, s, -1, nullptr, 0);
++        std::wstring w(n > 0 ? n - 1 : 0, L'\0');
++        if (n > 0) { MultiByteToWideChar(CP_UTF8, 0, s, -1, w.data(), n); }
++        return w;
++    };
++    return _wfopen(wide(fname).c_str(), wide(mode).c_str());
++}
++#else
++static inline FILE * llama_fopen_local(const char * fname, const char * mode) { return fopen(fname, mode); }
++#endif
+diff --git a/src/llama-mmap.cpp b/src/llama-mmap.cpp
+index 02e4ede..8b0cdfd 100644
+--- a/src/llama-mmap.cpp
++++ b/src/llama-mmap.cpp
+@@ -165,7 +165,7 @@ struct llama_file::impl {
+     }
+ 
+     void init_buffered_io(const char * mode) {
+-        fp = ggml_fopen(fname.c_str(), mode);
++        fp = llama_fopen_local(fname.c_str(), mode);
+         if (fp == NULL) {
+             throw std::runtime_error(format("failed to open %s: %s", fname.c_str(), strerror(errno)));
+         }
+@@ -438,7 +438,7 @@ struct llama_file::impl {
+ #endif
+ 
+     void init_fp(const char * mode) {
+-        fp = ggml_fopen(fname.c_str(), mode);
++        fp = llama_fopen_local(fname.c_str(), mode);
+         if (fp == NULL) {
+             throw std::runtime_error(format("failed to open %s: %s", fname.c_str(), strerror(errno)));
+         }
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 808fb44..93a6325 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -663,7 +663,7 @@ llama_model_loader::llama_model_loader(
+         for (size_t idx = 1; idx < paths.size(); idx++) {
+             const char * fname_split = paths[idx].c_str();
+             if (skip_shard_order_validation && idx < n_backbone) {
+-                FILE * f = ggml_fopen(fname_split, "rb");
++                FILE * f = llama_fopen_local(fname_split, "rb");
+                 if (f == nullptr) {
+                     LLAMA_LOG_INFO("%s: GGUF split %s not found, assuming it only holds the per-layer embedding table\n", __func__, fname_split);
+                     n_skipped++;
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index ba35af0..c1afc4b 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -54,6 +54,11 @@ struct moe_cache_lru {
+     std::vector<int32_t> misses;
+     std::vector<uint64_t> token_zero; // [n_tokens] zero slots used by each token
+ 
++    // pinned mode (LLAMA_MOE_CACHE_PIN=file of "layer expert" lines): only the listed experts enter the cache,
++    // every other miss is computed on the CPU, so nothing is uploaded after the pinned experts are in
++    bool pin_mode = false;
++    std::vector<uint8_t> pinned; // [n_layer*n_expert]
++
+     void init(int32_t n_layer, int32_t n_expert, int32_t n_slots) {
+         GGML_ASSERT(n_class == (int) std::log2(1.0f/(1.0f - std::exp2(-1.0f/crf_half_life))) + 1);
+         this->n_expert = n_expert;
+@@ -78,6 +83,23 @@ struct moe_cache_lru {
+         last_use.assign((size_t) n_layer*n_expert, -1);
+         clock.assign(n_layer, 0);
+         seen.assign(n_expert, 0);
++        pinned.assign((size_t) n_layer*n_expert, 0);
++        if (const char * path = getenv("LLAMA_MOE_CACHE_PIN")) {
++            FILE * f = fopen(path, "r");
++            if (f == nullptr) {
++                GGML_ABORT("LLAMA_MOE_CACHE_PIN: cannot open %s", path);
++            }
++            int il, e, n = 0;
++            while (fscanf(f, "%d %d", &il, &e) == 2) {
++                if (il >= 0 && il < n_layer && e >= 0 && e < n_expert) {
++                    pinned[(size_t) il*n_expert + e] = 1;
++                    n++;
++                }
++            }
++            fclose(f);
++            pin_mode = true;
++            LLAMA_LOG_INFO("%s: MoE cache pinned mode, %d experts listed in %s, %d slots\n", __func__, n, path, n_slots);
++        }
+     }
+ 
+     // move slot s to the most recently used end of list c
+@@ -224,13 +246,20 @@ struct moe_cache_lru {
+ 
+         // the misses with the lowest CRF are left to the CPU, a miss that keeps being used gains CRF and enters the cache
+         // all misses are used at the same clock, so their CRF compare without decay
+-        const size_t n_c = std::min(n_cpu(misses.size()), misses.size());
+-        if (n_c > 0) {
++        size_t n_c = std::min(n_cpu(misses.size()), misses.size());
++        if (pin_mode) {
++            // the misses that are not pinned go to the CPU, the pinned ones are uploaded once
++            auto mid = std::stable_partition(misses.begin(), misses.end(), [&](int32_t e) { return !pinned[make_key(il, e)]; });
++            n_c = (size_t) (mid - misses.begin());
++        }
++        if (n_c > 0 && !pin_mode) {
+             std::sort(misses.begin(), misses.end(), [&](int32_t a, int32_t b) {
+                 const float crf_a = crf[make_key(il, a)];
+                 const float crf_b = crf[make_key(il, b)];
+                 return crf_a != crf_b ? crf_a < crf_b : a < b;
+             });
++        }
++        if (n_c > 0) {
+             GGML_ASSERT((size_t) n_tokens*n_used == n_ids);
+             token_zero.assign(n_tokens, 0);
+             size_t n_keep = n_c;
